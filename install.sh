@@ -13,7 +13,7 @@
 # minimal images have shipped without bash. No pipefail, no arrays, no [[ ]].
 set -eu
 
-DEFAULT_VERSION=0.1.1
+DEFAULT_VERSION=0.1.2
 # Where release assets live. The install repository, not the platform repository: the packages
 # are published for hosts to download, and the platform source is not what a monitored host
 # needs. https://github.com/ankittshrmaa/findoc_linux_exporter
@@ -114,6 +114,16 @@ fi
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=$(mktemp -d)
+# mktemp -d gives 0700, and apt drops privileges to the `_apt` user to read the package it is
+# told to install. It cannot traverse a 0700 directory, so every Debian install printed:
+#
+#   N: Download is performed unsandboxed as root as file '/tmp/tmp.XXXX/...deb' couldn't be
+#      accessed by user '_apt'. - pkgAcquire::Run (13: Permission denied)
+#
+# apt proceeds unsandboxed rather than failing, so this was noise rather than breakage — but it
+# is noise on every install, and noise that mentions permissions and sandboxing invites someone
+# to go looking for a problem that is not there.
+chmod 0755 "$WORK"
 # shellcheck disable=SC2064
 trap "rm -rf '$WORK'" EXIT INT TERM
 
