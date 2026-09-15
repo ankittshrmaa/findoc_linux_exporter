@@ -1,0 +1,5 @@
+# Shell scripts must stay LF: a CRLF install.sh fails on the host with
+#     /bin/sh^M: bad interpreter
+# which names neither the file nor the cause.
+* text=auto
+*.sh text eol=lf
