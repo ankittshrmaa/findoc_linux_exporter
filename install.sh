@@ -211,9 +211,20 @@ fi
 # exporter.env and the host identity, and the services are restarted onto the new binaries.
 say "Installing"
 if [ "$FAMILY" = debian ]; then
-    if ! dpkg -i "$PKG"; then
-        # `dpkg -i` does not resolve dependencies. The package needs only `adduser`, which is
-        # present on any normal Debian host, but a minimal image may not have it.
+    # `apt-get install ./file.deb`, not `dpkg -i`.
+    #
+    # dpkg resolves neither dependencies nor conflicts. On a host still carrying the
+    # pre-rename `findoc-exporter` package it failed outright:
+    #
+    #   trying to overwrite '/lib/systemd/system/findoc-exporter-heartbeat.service',
+    #   which is also in package findoc-exporter 0.1.0
+    #
+    # apt understands the Conflicts/Replaces the package now declares, so it removes the old
+    # one and installs this in a single step. Supported since apt 1.1 (Debian 9), which is
+    # below the glibc floor, so every supported host has it.
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get -y install "$PKG" || die "apt-get could not install $(basename "$PKG")."
+    elif ! dpkg -i "$PKG"; then
         info "resolving dependencies"
         apt-get -y -f install || die "dpkg install failed and apt-get -f could not repair it."
     fi
@@ -226,6 +237,33 @@ else
         yum -y install "$PKG" || die "yum install failed."
     fi
 fi
+
+# --- 5b. prove the install actually took ---------------------------------------------------------
+#
+# **Not optional, and this is why.** On a real host the install failed on a file conflict, the
+# recovery step (`apt-get -f install`) returned 0 because there were no broken dependencies to
+# fix — the problem was a conflict, not a dependency — and the script carried on. It then
+# reported `heartbeat active / metrics active`, which were the OLD package's services still
+# running, and `version unknown`, which was the only hint anything was wrong.
+#
+# So the package manager's exit code is not trusted on its own. The installed agent is asked
+# what it is, and the answer has to match what was just installed.
+AGENT=/opt/findoc-exporter/bin/findoc-agent/findoc-agent
+[ -x "$AGENT" ] || die "the install reported success but $AGENT is not there.
+     Nothing was installed. Check the output above for what the package manager actually did."
+
+INSTALLED_VER=$("$AGENT" --version 2>/dev/null | head -1)
+case "$INSTALLED_VER" in
+findoc-agent*) ;;
+*)
+    die "the installed agent does not report a version:
+       ${INSTALLED_VER:-<no output>}
+     That means the binary on this host is NOT the one just installed — an older build is
+     still in place and the new package did not take. Look for a conflicting package:
+       dpkg -l | grep findoc      /      rpm -qa | grep findoc"
+    ;;
+esac
+info "installed: $INSTALLED_VER"
 
 # --- 6. start both planes, but only if there is somewhere to report to ---------------------------
 #
@@ -240,7 +278,6 @@ fi
 # `enable` still happens either way, so a host configured later comes up correctly at boot.
 # `.target` is required — systemd resolves a bare name to .service and there is deliberately no
 # findoc-exporter.service; see the comment block in findoc-exporter.target.
-AGENT=/opt/findoc-exporter/bin/findoc-agent/findoc-agent
 BACKEND_OK=no
 if env -u FINDOC_BACKEND -u FINDOC_SITE "$AGENT" --show-backend >/dev/null 2>&1; then
     BACKEND_OK=yes
