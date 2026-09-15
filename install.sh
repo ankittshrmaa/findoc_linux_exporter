@@ -13,7 +13,7 @@
 # minimal images have shipped without bash. No pipefail, no arrays, no [[ ]].
 set -eu
 
-DEFAULT_VERSION=0.1.0
+DEFAULT_VERSION=0.1.1
 # Where release assets live. The install repository, not the platform repository: the packages
 # are published for hosts to download, and the platform source is not what a monitored host
 # needs. https://github.com/ankittshrmaa/findoc_linux_exporter
