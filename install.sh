@@ -16,7 +16,7 @@ set -eu
 # Upstream version and package revision, as the packages are now named. A packaging-only
 # fix moves REVISION; the software version stays put.
 DEFAULT_VERSION=0.1.3
-DEFAULT_REVISION=1
+DEFAULT_REVISION=2
 # Where release assets live. The install repository, not the platform repository: the packages
 # are published for hosts to download, and the platform source is not what a monitored host
 # needs. https://github.com/ankittshrmaa/findoc_linux_exporter

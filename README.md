@@ -38,6 +38,107 @@ one does not touch the other.
 | `/etc/findoc-monitor/host-id` | This host's identity. **Never delete it** — see below |
 | `/var/log/journal` (`journalctl`) | Logs |
 
+---
+
+## Architecture — what this package actually does
+
+Two services, two planes, and they never touch each other. That separation is the whole design,
+not an implementation detail: it is what lets the platform tell **"the host is dead"** apart from
+**"the exporter stopped answering"**, which are different incidents with different owners and
+very different urgency.
+
+```
+   THIS HOST                                    THE SITE (same LAN)              THE CORE
+  ┌──────────────────────────────────┐
+  │                                  │
+  │  findoc-exporter-heartbeat       │   ~40 B every 1 s, OUTBOUND
+  │  ─────────────────────────       │   ─────────────────────────▶ ┌───────────────┐
+  │  /opt/.../bin/findoc-agent       │   persistent NATS connection  │               │
+  │  Nice=10, pinned off isolated    │   nats://<backend>:4222       │     SITE      │
+  │  cores. Restart=always, 1 s.     │                               │   COLLECTOR   │
+  │                                  │                               │               │
+  │         LIVENESS PLANE           │                               │  • 3 missed   │
+  │                                  │                               │    beats →    │
+  ├──────────────────────────────────┤                               │    host down  │
+  │                                  │                               │  • evaluates  │
+  │  findoc-exporter-metrics         │   scraped every ~10 s         │    rules in   │
+  │  ─────────────────────────       │   ◀───────────────────────── │    memory     │
+  │  node_exporter on :9100          │   INBOUND over the LAN        │  • DISPATCHES │
+  │  --collector.disable-defaults    │   (never across a WAN)        │    THE PAGE   │
+  │  + only what the contract needs  │                               │       │       │
+  │                                  │                               └───────┼───────┘
+  │         METRICS PLANE            │                                       │
+  │                                  │                              alerts leave from
+  └──────────────────────────────────┘                              HERE, not the core
+                                                                             │
+                                                                     NATS leaf ▼
+                                                                    ┌──────────────┐
+                                                                    │ core: store, │
+                                                                    │ dashboard,   │
+                                                                    │ correlation  │
+                                                                    └──────────────┘
+                                                                    history + screens
+                                                                    NOT the alert path
+```
+
+### Why two services and not one
+
+| | Liveness plane | Metrics plane |
+|---|---|---|
+| Process | `findoc-agent` (frozen, ships its own CPython) | `node_exporter` |
+| Direction | **Outbound.** It connects to the site. | **Inbound.** The collector connects to it. |
+| Cadence | ~40 bytes, every second | Scraped every ~10 seconds |
+| Answers | Is this machine alive? | What is this machine doing? |
+| If it stops | The host is declared down in **under 5 seconds** | `exporter_down`, a low-severity ticket |
+
+A single process would put the answer to "is this host alive" behind the same scrape cycle, the
+same GC pause and the same restart as a metrics exporter parsing a thousand series. Then a slow
+scrape would look exactly like a dead trading host. Keeping them apart is why a kill is detected
+in seconds rather than at the next scrape interval.
+
+`systemctl stop findoc-exporter-metrics` does not touch the heartbeat, and vice versa. Stop the
+**target** to stop both.
+
+### Where the alert comes from, and where it does not
+
+The page is dispatched by the **site collector**, on the same LAN as this host. It does not wait
+for the core, the message bus, or the WAN link — if the link to the core drops, the site keeps
+alerting and merely stops updating the central dashboard.
+
+So the core in the diagram is storage, screens and cross-site correlation. It is deliberately
+**not** on the alert path. That is why the heartbeat here is a persistent outbound connection to
+the *site*, and why the exporter is scraped over the LAN and never across a WAN.
+
+### What the heartbeat actually detects
+
+A clean shutdown closes the TCP connection, and the collector sees that in **sub-second** time —
+no heartbeat needed. The 1-second frame exists for the cases where nothing gets to say goodbye:
+
+- power loss
+- kernel panic
+- a severed network link
+
+Three consecutive misses declares the host down. That threshold is tunable per host class; for
+trading hosts it may be two.
+
+### What the package puts on disk
+
+```
+/opt/findoc-exporter/bin/findoc-agent/     frozen agent — its own CPython and OpenSSL,
+                                           which is why one artifact covers CentOS 7
+                                           through Ubuntu 24.04
+/opt/findoc-exporter/bin/node_exporter     upstream binary, checksum-verified at build
+/etc/findoc-exporter/exporter.env          the ONE file an operator edits
+/var/lib/findoc-exporter/host-id           the UUID issued at install — this host's
+                                           identity, not its hostname
+```
+
+**Identity is a UUID, not a hostname.** The estate spans several AD domains, where hostnames are
+not unique and do change. `host-id` is written once at install and survives a rename; delete it
+and the host comes back as a *new* pending host rather than as itself.
+
+---
+
 ## Requirements
 
 - **Linux, x86_64.** The installer refuses anything else rather than installing a package that
@@ -103,8 +204,8 @@ sudo FINDOC_BACKEND=nats.your-site.internal:4222 ./install.sh
 
 | File | Size | What it is |
 |---|---|---|
-| `findoc-linux-exporter_0.1.3-1_amd64.deb` | 25 MB | Debian, Ubuntu, and anything `ID_LIKE=debian` |
-| `findoc-linux-exporter-0.1.3-1.el7.x86_64.rpm` | 33 MB | RHEL 7+, Rocky, Alma, Oracle Linux |
+| `findoc-linux-exporter_0.1.3-2_amd64.deb` | 25 MB | Debian, Ubuntu, and anything `ID_LIKE=debian` |
+| `findoc-linux-exporter-0.1.3-2.el7.x86_64.rpm` | 33 MB | RHEL 7+, Rocky, Alma, Oracle Linux |
 | `*.sha256` | — | Verified before install, always. A mismatch aborts. |
 | `*.asc` | — | Detached GPG signature. See below. |
 
