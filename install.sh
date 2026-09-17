@@ -13,7 +13,10 @@
 # minimal images have shipped without bash. No pipefail, no arrays, no [[ ]].
 set -eu
 
-DEFAULT_VERSION=0.1.2
+# Upstream version and package revision, as the packages are now named. A packaging-only
+# fix moves REVISION; the software version stays put.
+DEFAULT_VERSION=0.1.3
+DEFAULT_REVISION=1
 # Where release assets live. The install repository, not the platform repository: the packages
 # are published for hosts to download, and the platform source is not what a monitored host
 # needs. https://github.com/ankittshrmaa/findoc_linux_exporter
@@ -106,10 +109,16 @@ need_downloader() {
      no network at all."
 }
 
+# $1 is the full version-revision string, e.g. 0.1.0-4.
 if [ "$FAMILY" = debian ]; then
     pkg_name() { printf 'findoc-linux-exporter_%s_%s.deb' "$1" "$DEB_ARCH"; }
 else
-    pkg_name() { printf 'findoc-linux-exporter-%s-1.el7.%s.rpm' "$1" "$RPM_ARCH"; }
+    # RPM splits it: 0.1.0-4 becomes Version 0.1.0, Release 4.
+    pkg_name() {
+        _v=${1%-*}
+        _r=${1##*-}
+        printf 'findoc-linux-exporter-%s-%s.el7.%s.rpm' "$_v" "$_r" "$RPM_ARCH"
+    }
 fi
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -178,7 +187,7 @@ fi
 # 3c. GitHub Releases, last, because a trading host reaching the public internet is the
 #     exception rather than the rule.
 if [ -z "$PKG" ]; then
-    [ -n "$VERSION" ] || VERSION="$DEFAULT_VERSION"
+    [ -n "$VERSION" ] || VERSION="${DEFAULT_VERSION}-${DEFAULT_REVISION}"
     NAME=$(pkg_name "$VERSION")
     URL="https://github.com/$GITHUB_REPO/releases/download/v$VERSION/$NAME"
     say "Downloading from GitHub Releases"
@@ -215,6 +224,43 @@ else
     info "no .sha256 alongside the package — checksum NOT verified"
 fi
 
+# --- 4b. verify the SIGNATURE, which is the one that proves origin --------------------------------
+#
+# The checksum above proves the bytes arrived intact. It proves nothing about who produced them:
+# it travels beside the package, so whoever can replace one can replace the other. A detached GPG
+# signature cannot be forged without the private key.
+#
+# The public key has to reach the host by a different route than the package — shipped in the
+# base image, pushed by configuration management, or installed by hand once. A key downloaded
+# from the same server as the package it verifies is decoration.
+FINDOC_GPG_KEY="${FINDOC_GPG_KEY:-/etc/findoc-exporter/signing-key.asc}"
+if [ -f "${PKG}.asc" ] && [ -f "$FINDOC_GPG_KEY" ] && command -v gpg >/dev/null 2>&1; then
+    GNUPGHOME=$(mktemp -d)
+    export GNUPGHOME
+    chmod 700 "$GNUPGHOME"
+    gpg --batch --quiet --import "$FINDOC_GPG_KEY" 2>/dev/null || true
+    if gpg --batch --verify "${PKG}.asc" "$PKG" >/dev/null 2>&1; then
+        info "GPG signature verified against $FINDOC_GPG_KEY"
+    else
+        rm -rf "$GNUPGHOME"
+        die "the GPG signature on $(basename "$PKG") does NOT verify.
+     Do not install this. Either the package was modified after signing, or it was signed by
+     a key this host does not trust."
+    fi
+    rm -rf "$GNUPGHOME"
+    unset GNUPGHOME
+elif [ -f "${PKG}.asc" ]; then
+    # A signature is present and cannot be checked. Say which half is missing rather than
+    # implying the package is suspect.
+    if [ ! -f "$FINDOC_GPG_KEY" ]; then
+        info "signature present but NOT verified: no public key at $FINDOC_GPG_KEY"
+    else
+        info "signature present but NOT verified: gpg is not installed"
+    fi
+else
+    info "package is UNSIGNED — origin not verified, only integrity"
+fi
+
 # --- 5. install -------------------------------------------------------------------------------------
 #
 # Re-running is the upgrade path: both package managers replace in place, the scriptlets keep
@@ -241,10 +287,24 @@ if [ "$FAMILY" = debian ]; then
 else
     # `yum install`, not `rpm -i`, so shadow-utils resolves rather than failing on a bare
     # dependency the host happens to lack.
+    #
+    # THEN THE SAME THING AGAIN WITH THE REPOS OFF, and that second attempt is what makes an
+    # air-gapped install work. dnf refreshes repository metadata before installing even a local
+    # file, so on a host with no route to a mirror it fails on `Could not resolve host` while
+    # holding the package it was asked to install — measured on Rocky 9 with the network
+    # detached. `--disablerepo` skips the refresh; it does NOT skip dependency checking, which
+    # still runs against the installed rpmdb, so a genuinely missing dependency is still
+    # refused. This package needs shadow-utils, systemd and /bin/sh, which are present on any
+    # host that boots.
+    #
+    # Order matters: online first, so a host that CAN reach a mirror still resolves anything
+    # absent. The fallback only rescues the case the first attempt cannot serve.
     if command -v dnf >/dev/null 2>&1; then
-        dnf -y install "$PKG" || die "dnf install failed."
+        dnf -y install "$PKG"             || { info "repository metadata unavailable; installing from the local file only"
+                 dnf -y --disablerepo='*' install "$PKG" || die "dnf install failed."; }
     else
-        yum -y install "$PKG" || die "yum install failed."
+        yum -y install "$PKG"             || { info "repository metadata unavailable; installing from the local file only"
+                 yum -y --disablerepo='*' install "$PKG" || die "yum install failed."; }
     fi
 fi
 

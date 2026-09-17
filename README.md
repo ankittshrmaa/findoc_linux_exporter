@@ -9,8 +9,12 @@ cd findoc_linux_exporter
 sudo ./install.sh
 ```
 
-That is the whole thing on a host where DNS discovery is set up. Everything below is detail for
-when it is not, or when something goes wrong.
+That is the whole thing, and it needs **no network at all** — not even to reach this repo a
+second time. The packages are committed under `dist/`, so the clone you just did is the delivery
+mechanism. There is no server to stand up, no mirror to configure, and nothing to publish before
+a host can be onboarded.
+
+Everything below is detail for when discovery is not set up, or when something goes wrong.
 
 ---
 
@@ -87,10 +91,37 @@ sudo FINDOC_BACKEND=nats.your-site.internal:4222 ./install.sh
 
 `install.sh` looks in this order, and stops at the first that works:
 
-1. **A package next to the script** — `findoc-linux-exporter_*.deb` or `*.rpm` in this directory,
-   or in `dist/`. No network needed at all.
-2. **`FINDOC_URL`** — an internal HTTP server.
-3. **GitHub Releases** — the fallback.
+1. **A package in `dist/`, or next to the script.** This is the normal path now: the packages
+   ship in this repository, so a `git clone` already has them. No network, no mirror, no
+   release to download.
+2. **`FINDOC_URL`** — an internal HTTP server. For an estate that mirrors packages itself, or
+   that wants a version this clone does not carry.
+3. **GitHub Releases** — the fallback, and last on purpose. A trading host reaching the public
+   internet is the exception rather than the rule.
+
+### What ships in `dist/`
+
+| File | Size | What it is |
+|---|---|---|
+| `findoc-linux-exporter_0.1.3-1_amd64.deb` | 25 MB | Debian, Ubuntu, and anything `ID_LIKE=debian` |
+| `findoc-linux-exporter-0.1.3-1.el7.x86_64.rpm` | 33 MB | RHEL 7+, Rocky, Alma, Oracle Linux |
+| `*.sha256` | — | Verified before install, always. A mismatch aborts. |
+| `*.asc` | — | Detached GPG signature. See below. |
+
+Each package carries its own `node_exporter`, its own CPython and its own OpenSSL, which is why
+one artifact covers CentOS 7 through Ubuntu 24.04 and why they are this size.
+
+**The signing key is deliberately NOT in this repository.** A key that travels with the package
+it verifies proves nothing — anyone who can replace one can replace the other. Put the public key
+on the host by a different route (base image, configuration management, or once by hand) at
+`/etc/findoc-exporter/signing-key.asc`, and `install.sh` will verify against it. Without it the
+installer says so plainly and continues: integrity is checked, origin is not.
+
+**A note for whoever maintains this.** Committing 58 MB of packages per release is a deliberate
+trade: it makes onboarding work on an air-gapped host with nothing but `git`, and it grows this
+repository by that much on every version bump, permanently. Keep `dist/` to the current release
+only — replacing rather than accumulating — and if the history ever becomes a problem, the answer
+is Git LFS or going back to Releases, not deleting files from `dist/` and hoping.
 
 ## What success looks like
 

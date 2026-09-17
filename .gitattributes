@@ -3,3 +3,17 @@
 # which names neither the file nor the cause.
 * text=auto
 *.sh text eol=lf
+
+# Packages are BINARY, stated rather than sniffed.
+#
+# `* text=auto` above asks git to guess, and a 25 MB .deb that it ever guessed was text would
+# be rewritten on checkout and then fail its own sha256 on the host -- loudly, but for a reason
+# nobody would work out from the message. The packages are the whole point of this repository
+# now, so nothing about them should be left to detection.
+*.deb binary
+*.rpm binary
+
+# Signatures and checksums ARE text, and must stay LF. `sha256sum -c` compares the whole line,
+# so one trailing CR makes a correct checksum fail.
+*.asc    text eol=lf
+*.sha256 text eol=lf
