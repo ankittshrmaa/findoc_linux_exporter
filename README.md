@@ -1,409 +1,240 @@
-# findoc_linux_exporter — install
+# findoc_linux_exporter
 
-Installs the Findoc Monitoring agent on a Linux host. One command, both monitoring services,
-no configuration file to edit.
+Installs the Findoc Monitoring agent on a Linux host: one package, one service, and **no
+listening network port**.
+
+## Install
 
 ```bash
 git clone https://github.com/ankittshrmaa/findoc_linux_exporter.git
 cd findoc_linux_exporter
-sudo ./install.sh
+sudo FINDOC_BACKEND=<your-site-collector>:4222 ./install.sh
 ```
 
-That is the whole thing, and it needs **no network at all** — not even to reach this repo a
-second time. The packages are committed under `dist/`, so the clone you just did is the delivery
-mechanism. There is no server to stand up, no mirror to configure, and nothing to publish before
-a host can be onboarded.
+Replace `<your-site-collector>` with your site's NATS address, for example
+`nats.mumbai.internal`. That is the whole install. The packages ship in `dist/`, so it needs no
+internet access once the clone is on the host.
 
-Everything below is detail for when discovery is not set up, or when something goes wrong.
-
----
-
-## What gets installed
-
-Two services, which run **independently on purpose**:
-
-| Service | Port | What it does |
-|---|---|---|
-| `findoc-exporter-heartbeat` | — | Sends a ~40 byte "alive" frame every second. This is what detects a dead host in under five seconds. |
-| `findoc-exporter-metrics` | `9100` | `node_exporter`, trimmed to the metrics the platform actually uses. Scraped over the LAN by the site collector. |
-
-They have no dependency on each other. "The exporter stopped answering" and "the host is dead"
-are different facts: the first is a low-severity ticket, the second wakes somebody up. Stopping
-one does not touch the other.
-
-| Path | What it is |
-|---|---|
-| `/opt/findoc-exporter/` | Programs and licences |
-| `/etc/findoc-exporter/exporter.env` | The only file you might edit |
-| `/etc/findoc-monitor/host-id` | This host's identity. **Never delete it** — see below |
-| `/var/log/journal` (`journalctl`) | Logs |
-
----
-
-## Architecture — what this package actually does
-
-Two services, two planes, and they never touch each other. That separation is the whole design,
-not an implementation detail: it is what lets the platform tell **"the host is dead"** apart from
-**"the exporter stopped answering"**, which are different incidents with different owners and
-very different urgency.
-
-```
-   THIS HOST                                    THE SITE (same LAN)              THE CORE
-  ┌──────────────────────────────────┐
-  │                                  │
-  │  findoc-exporter-heartbeat       │   ~40 B every 1 s, OUTBOUND
-  │  ─────────────────────────       │   ─────────────────────────▶ ┌───────────────┐
-  │  /opt/.../bin/findoc-agent       │   persistent NATS connection  │               │
-  │  Nice=10, pinned off isolated    │   nats://<backend>:4222       │     SITE      │
-  │  cores. Restart=always, 1 s.     │                               │   COLLECTOR   │
-  │                                  │                               │               │
-  │         LIVENESS PLANE           │                               │  • 3 missed   │
-  │                                  │                               │    beats →    │
-  ├──────────────────────────────────┤                               │    host down  │
-  │                                  │                               │  • evaluates  │
-  │  findoc-exporter-metrics         │   scraped every ~10 s         │    rules in   │
-  │  ─────────────────────────       │   ◀───────────────────────── │    memory     │
-  │  node_exporter on :9100          │   INBOUND over the LAN        │  • DISPATCHES │
-  │  --collector.disable-defaults    │   (never across a WAN)        │    THE PAGE   │
-  │  + only what the contract needs  │                               │       │       │
-  │                                  │                               └───────┼───────┘
-  │         METRICS PLANE            │                                       │
-  │                                  │                              alerts leave from
-  └──────────────────────────────────┘                              HERE, not the core
-                                                                             │
-                                                                     NATS leaf ▼
-                                                                    ┌──────────────┐
-                                                                    │ core: store, │
-                                                                    │ dashboard,   │
-                                                                    │ correlation  │
-                                                                    └──────────────┘
-                                                                    history + screens
-                                                                    NOT the alert path
-```
-
-### Why two services and not one
-
-| | Liveness plane | Metrics plane |
-|---|---|---|
-| Process | `findoc-agent` (frozen, ships its own CPython) | `node_exporter` |
-| Direction | **Outbound.** It connects to the site. | **Inbound.** The collector connects to it. |
-| Cadence | ~40 bytes, every second | Scraped every ~10 seconds |
-| Answers | Is this machine alive? | What is this machine doing? |
-| If it stops | The host is declared down in **under 5 seconds** | `exporter_down`, a low-severity ticket |
-
-A single process would put the answer to "is this host alive" behind the same scrape cycle, the
-same GC pause and the same restart as a metrics exporter parsing a thousand series. Then a slow
-scrape would look exactly like a dead trading host. Keeping them apart is why a kill is detected
-in seconds rather than at the next scrape interval.
-
-`systemctl stop findoc-exporter-metrics` does not touch the heartbeat, and vice versa. Stop the
-**target** to stop both.
-
-### Where the alert comes from, and where it does not
-
-The page is dispatched by the **site collector**, on the same LAN as this host. It does not wait
-for the core, the message bus, or the WAN link — if the link to the core drops, the site keeps
-alerting and merely stops updating the central dashboard.
-
-So the core in the diagram is storage, screens and cross-site correlation. It is deliberately
-**not** on the alert path. That is why the heartbeat here is a persistent outbound connection to
-the *site*, and why the exporter is scraped over the LAN and never across a WAN.
-
-### What the heartbeat actually detects
-
-A clean shutdown closes the TCP connection, and the collector sees that in **sub-second** time —
-no heartbeat needed. The 1-second frame exists for the cases where nothing gets to say goodbye:
-
-- power loss
-- kernel panic
-- a severed network link
-
-Three consecutive misses declares the host down. That threshold is tunable per host class; for
-trading hosts it may be two.
-
-### What the package puts on disk
-
-```
-/opt/findoc-exporter/bin/findoc-agent/     frozen agent — its own CPython and OpenSSL,
-                                           which is why one artifact covers CentOS 7
-                                           through Ubuntu 24.04
-/opt/findoc-exporter/bin/node_exporter     upstream binary, checksum-verified at build
-/etc/findoc-exporter/exporter.env          the ONE file an operator edits
-/var/lib/findoc-exporter/host-id           the UUID issued at install — this host's
-                                           identity, not its hostname
-```
-
-**Identity is a UUID, not a hostname.** The estate spans several AD domains, where hostnames are
-not unique and do change. `host-id` is written once at install and survives a rename; delete it
-and the host comes back as a *new* pending host rather than as itself.
-
----
-
-## Requirements
-
-- **Linux, x86_64.** The installer refuses anything else rather than installing a package that
-  cannot run.
-- **systemd.** Present on every supported distribution.
-- **Outbound TCP to port 4222** on the site's collector. That is the only network access the
-  agent needs.
-- Nothing else. No Python, no runtime, no dependencies — the agent carries its own.
-
-### Supported distributions
-
-Every one of these was tested by running the agent on it:
-
-| | |
-|---|---|
-| **Red Hat family** | CentOS 7, RHEL 7 · RHEL/CentOS/Rocky/AlmaLinux 8 · RHEL/CentOS Stream/Rocky/AlmaLinux 9 |
-| **Debian family** | Debian 10, 11, 12 · Ubuntu 18.04, 20.04, 22.04, 24.04 |
-
-Older than that will refuse to start with a clear `GLIBC` error rather than misbehave.
-
-## Installing
-
-### The normal case
+If your estate has a `findoc-collector` DNS record, leave the variable out:
 
 ```bash
 sudo ./install.sh
 ```
 
-The agent finds the collector by DNS, so there is nothing to configure. It looks for a host
-named `findoc-collector`, then `findoc-monitor`, resolved through this machine's own DNS search
-suffix — one DNS record covers the whole estate.
+### Check it worked
 
-### If DNS discovery is not set up
-
-Tell it where to report, once. The value is written into `exporter.env` and remembered:
-
-```bash
-sudo FINDOC_BACKEND=nats.your-site.internal:4222 ./install.sh
-```
-
-### Other options
-
-| Variable | Use it when |
-|---|---|
-| `FINDOC_BACKEND=host:4222` | DNS discovery is not available |
-| `FINDOC_SITE=mumbai` | This host belongs to a named site (must match the collector's) |
-| `FINDOC_URL=http://packages.internal/findoc` | Hosts cannot reach GitHub — see [air-gapped](#air-gapped-and-restricted-networks) |
-| `FINDOC_VERSION=0.2.0` | Pin a specific version instead of the latest |
-
-### Where the package comes from
-
-`install.sh` looks in this order, and stops at the first that works:
-
-1. **A package in `dist/`, or next to the script.** This is the normal path now: the packages
-   ship in this repository, so a `git clone` already has them. No network, no mirror, no
-   release to download.
-2. **`FINDOC_URL`** — an internal HTTP server. For an estate that mirrors packages itself, or
-   that wants a version this clone does not carry.
-3. **GitHub Releases** — the fallback, and last on purpose. A trading host reaching the public
-   internet is the exception rather than the rule.
-
-### What ships in `dist/`
-
-| File | Size | What it is |
-|---|---|---|
-| `findoc-linux-exporter_0.1.3-2_amd64.deb` | 25 MB | Debian, Ubuntu, and anything `ID_LIKE=debian` |
-| `findoc-linux-exporter-0.1.3-2.el7.x86_64.rpm` | 33 MB | RHEL 7+, Rocky, Alma, Oracle Linux |
-| `*.sha256` | — | Verified before install, always. A mismatch aborts. |
-| `*.asc` | — | Detached GPG signature. See below. |
-
-Each package carries its own `node_exporter`, its own CPython and its own OpenSSL, which is why
-one artifact covers CentOS 7 through Ubuntu 24.04 and why they are this size.
-
-**The signing key is deliberately NOT in this repository.** A key that travels with the package
-it verifies proves nothing — anyone who can replace one can replace the other. Put the public key
-on the host by a different route (base image, configuration management, or once by hand) at
-`/etc/findoc-exporter/signing-key.asc`, and `install.sh` will verify against it. Without it the
-installer says so plainly and continues: integrity is checked, origin is not.
-
-**A note for whoever maintains this.** Committing 58 MB of packages per release is a deliberate
-trade: it makes onboarding work on an air-gapped host with nothing but `git`, and it grows this
-repository by that much on every version bump, permanently. Keep `dist/` to the current release
-only — replacing rather than accumulating — and if the history ever becomes a problem, the answer
-is Git LFS or going back to Releases, not deleting files from `dist/` and hoping.
-
-## What success looks like
+The installer ends with a verdict, and it exits non-zero unless the host is actually monitored:
 
 ```
-==> Findoc Monitoring exporter installer
-    OS       = Linux
-    Distro   = Debian GNU/Linux 12 (bookworm)  (family: debian)
-    Arch     = x86_64 -> amd64
-==> Using the package already on this host
-    sha256 verified
-==> Installing
-==> Starting both planes
-
 ==> Result
-    version   findoc-agent 0.1.0 (CPython 3.12.11, Linux x86_64)
-    heartbeat active
-    metrics   active
-    backend   nats://nats.your-site.internal:4222
+    version   findoc-agent 0.2.1-1 (CPython 3.12.11, Linux x86_64)
+    service   active
+    planes    all planes running: heartbeat, metrics, metrics-push
+    backend   nats://nats.mumbai.internal:4222
 
 Both planes are running. This host is monitored.
 ```
 
-**"Monitored" means both services are running *and* the agent has somewhere to report to.** The
-installer will not say it otherwise, and exits non-zero if it cannot.
-
-## When it does not work
-
-### "no backend is reachable"
-
-```
-Installed and enabled for boot, but NOT started: no backend is reachable.
-```
-
-The install worked. The agent has nowhere to report, so it was deliberately not started — an
-agent retrying an address that will never answer looks alive while monitoring nothing.
-
-Fix it with any one of:
+At any time afterwards:
 
 ```bash
-# tell it directly, then start
-sudo sh -c 'echo "FINDOC_BACKEND=nats.your-site.internal:4222" >> /etc/findoc-exporter/exporter.env'
-sudo systemctl start findoc-exporter.target
-
-# or a one-line file, if DNS cannot be changed
-echo "nats.your-site.internal:4222" | sudo tee /etc/findoc-monitor/backend
-
-# or ask the agent what it is looking for
-sudo /opt/findoc-exporter/bin/findoc-agent/findoc-agent --show-backend
+sudo /opt/findoc-exporter/bin/findoc-agent/findoc-monitor status
 ```
 
-### "unsupported architecture"
+```
+findoc-monitor 0.2.1-1
+host 3f2c6e0a-...
 
-The package is x86_64 only. The installer refuses rather than installing it, because
-`node_exporter` would run and the agent would not — leaving a host that reports metrics and
-whose death nobody notices.
+  service   OK     active (running), pid 309
+                   all planes running: heartbeat, metrics, metrics-push
+  liveness  OK     connected to nats://nats.mumbai.internal:4222, seq 361204, published 0.4s ago
+  metrics   OK     serving on /run/findoc-monitor-metrics.sock, 33/35 contract sources present
 
-### "unsupported distribution"
+OK
+```
 
-The host is not in the Debian or Red Hat family. Installing the wrong package format would leave
-a machine that looks installed and monitors nothing.
+Run it with `sudo`. The metrics socket is readable only by root and the service account.
 
-### "checksum mismatch"
+## Requirements
 
-The download did not match its published hash. **Do not install it.** Either the transfer was
-corrupted or the file was substituted.
+| | |
+|---|---|
+| CPU | x86_64 only. The installer refuses anything else. |
+| OS | CentOS/RHEL 7, RHEL/Rocky/Alma 8 and 9, Debian 10 to 12, Ubuntu 18.04 to 24.04 |
+| Init | systemd |
+| Network | **Outbound** TCP 4222 to the site collector. Nothing inbound. |
+| Software | Nothing. The agent carries its own Python and OpenSSL. |
 
-### "neither curl nor wget is installed"
+## Options
 
-Minimal image. Either install one, or copy the package next to `install.sh` — a local package
-needs no network.
+Pass these to `install.sh` as environment variables, as in the install command above.
 
-## Managing it afterwards
+| Variable | When to use it |
+|---|---|
+| `FINDOC_BACKEND=host:4222` | No `findoc-collector` DNS record for this host |
+| `FINDOC_SITE=mumbai` | The host belongs to a named site. Must match the site collector's `--site`. |
+| `FINDOC_URL=http://packages.internal/findoc` | Install from an internal mirror instead of `dist/` |
+| `FINDOC_VERSION=0.2.1-1` | Pin a version |
+| `FINDOC_GPG_KEY=/path/key.asc` | Where the public signing key is (default `/etc/findoc-exporter/signing-key.asc`) |
+
+## What gets installed
+
+One systemd service, `findoc-monitor`, running a small supervisor with three child processes:
+
+| Child | What it does |
+|---|---|
+| `heartbeat` | Holds one outbound NATS connection and sends a 40-byte frame every second. A dead host is detected in under five seconds. |
+| `metrics` | `node_exporter` 1.9.1, trimmed to the metrics the platform uses. It serves a UNIX socket that systemd owns, and opens **no TCP port**. |
+| `metrics-push` | Reads that socket and publishes the samples to the site collector over the same outbound link. |
+
+Each child is restarted on its own. A metrics fault never stops the heartbeat, so "the exporter
+stopped" and "the host is dead" stay different alerts with different urgency.
+
+| Path | What it is |
+|---|---|
+| `/opt/findoc-exporter/` | Programs and licences |
+| `/etc/findoc-monitor/findoc-monitor.conf` | The only file you might edit |
+| `/etc/findoc-monitor/host-id` | This host's identity. **Never delete it.** |
+| `journalctl -u findoc-monitor` | Logs, all three children in one stream |
+
+## Day to day
 
 ```bash
-# start or stop both at once
-sudo systemctl enable --now findoc-exporter.target
-sudo systemctl stop findoc-exporter-heartbeat findoc-exporter-metrics
+systemctl status findoc-monitor              # state, children, and which plane is down if any
+sudo systemctl restart findoc-monitor        # restart everything
+sudo systemctl stop findoc-monitor           # stop everything
+journalctl -u findoc-monitor -f              # logs
+sudo /opt/findoc-exporter/bin/findoc-agent/findoc-monitor status   # the health verdict
 
-# check one plane — NOT the target; see the note below
-systemctl is-active findoc-exporter-heartbeat
-systemctl is-active findoc-exporter-metrics
-
-# logs
-journalctl -u findoc-exporter-heartbeat -f
-journalctl -u findoc-exporter-metrics -f
-
-# what is it reporting to?
-sudo /opt/findoc-exporter/bin/findoc-agent/findoc-agent --show-backend
-
-# which version?
-/opt/findoc-exporter/bin/findoc-agent/findoc-agent --version
-
-# is the metrics endpoint answering?
-curl -s localhost:9100/metrics | head
+# change the backend or site
+sudo nano /etc/findoc-monitor/findoc-monitor.conf
+sudo systemctl restart findoc-monitor
 ```
 
-> **`findoc-exporter.target` starts things; it does not tell you whether they are healthy.** A
-> systemd target reports `active` once it has been *reached*, even if every service under it has
-> since stopped. To judge a host, name the plane:
-> `systemctl is-active findoc-exporter-heartbeat`.
->
-> Note also that `systemctl enable --now findoc-exporter` does **not** work — systemd expands a
-> bare name to `.service`, and there is deliberately no such unit. The `.target` suffix is
-> required.
+Restart the **service**, never `findoc-monitor.socket` on its own. The service pulls the socket
+back with it and is always safe.
 
 ## Upgrading
-
-Re-run the installer. It replaces the package in place, keeps `exporter.env` and the host
-identity, and restarts both services onto the new binaries.
 
 ```bash
 git pull
 sudo ./install.sh
 ```
 
-## Uninstalling
+Installing the package is the upgrade. The host identity and your configuration are kept.
+
+**Coming from 0.1.x** (the two services `findoc-exporter-heartbeat` and
+`findoc-exporter-metrics`, with `:9100` open): the upgrade moves the host onto `findoc-monitor`
+and disables the old units. Expect a few seconds with no heartbeat while that happens, so upgrade
+a site in batches. If the new service is not healthy within 30 seconds, the upgrade **rolls
+itself back** to the old units and says so. The host is never left unmonitored.
+
+To roll back by hand:
 
 ```bash
-sudo apt-get remove findoc-linux-exporter     # Debian / Ubuntu
-sudo yum remove findoc-linux-exporter         # RHEL / CentOS
+sudo systemctl disable --now findoc-monitor
+sudo systemctl enable --now findoc-exporter-metrics findoc-exporter-heartbeat
 ```
 
-Both remove the services, the programs and the configuration.
+## When it does not work
 
-**`/etc/findoc-monitor/host-id` is kept on purpose.** It is this host's name in the monitoring
-platform, not package configuration. A machine that came back with a new identity would be a
-*new* host: no history, no alert state, no operator approval. Deleting it orphans everything
-this machine has ever reported.
+| The installer or `findoc-monitor status` says | What to do |
+|---|---|
+| `NOT started: no backend is reachable` | The install worked, but the agent has nowhere to report. Set `FINDOC_BACKEND` in `/etc/findoc-monitor/findoc-monitor.conf`, then `sudo systemctl start findoc-monitor`. `findoc-agent --show-backend` shows what it is looking for. |
+| `liveness FAULT ... DISCONNECTED` | The agent runs but cannot reach the collector. This host is **invisible**: if it dies now, nobody is paged. Check the address and the network path to TCP 4222. |
+| `metrics DOWN (no listening socket ...)` | The metrics socket is missing. The heartbeat is unaffected. Run `sudo systemctl restart findoc-monitor`. |
+| `metrics FAULT ... families produce NO series` | A collector is being blocked. Report it with the full `status` output. |
+| status line says `heartbeat (restarted 47x)` | A child is crash-looping. Run `journalctl -u findoc-monitor \| grep exited`. |
+| `checksum mismatch` | **Do not install.** The file was corrupted or substituted. |
+| `unsupported architecture` / `unsupported distribution` | This host is not x86_64 Linux in the Debian or Red Hat family. |
 
-Cloning a VM? Run `findoc-agent --prepare-image` before sealing the template, or every clone
-reports as the same machine.
+## Signatures
 
-## Air-gapped and restricted networks
+Each package in `dist/` has a `.sha256`, which the installer always checks, and a detached
+`.asc` GPG signature.
 
-Hosts that cannot reach GitHub have two options.
+The public key is **deliberately not in this repository**. A key that travels with the package
+it verifies proves nothing. Put it on hosts by another route, such as the base image or
+configuration management, at `/etc/findoc-exporter/signing-key.asc`. The installer then verifies
+every package against it and refuses one that does not match. Without the key it says so and
+continues: integrity is checked, origin is not.
 
-**Copy the package alongside the installer:**
+> **0.2.1-1 is signed with the same TEST key as 0.1.3-2** (`Findoc Test Signing (THROWAWAY)`,
+> key ID `1FE55443`). It is not a production key. Production releases wait on a real release key
+> and a signed apt/yum repository.
+
+## Air-gapped hosts
+
+Copy the package, its `.sha256` and `.asc`, and `install.sh` into one directory on the host, then:
 
 ```bash
-scp findoc-linux-exporter_0.1.0_amd64.deb* host:/tmp/findoc/
-ssh host 'cd /tmp/findoc && sudo sh install.sh'
+sudo FINDOC_BACKEND=<collector>:4222 sh install.sh
 ```
 
-**Or host the packages internally.** Put the `.deb`, the `.rpm`, their `.sha256` files and a
-`latest.txt` containing the version number on any web server:
+Or serve them from any internal web server with a `latest.txt` containing the version:
 
 ```
 http://packages.internal/findoc/
-├── latest.txt                                     "0.1.0"
-├── findoc-linux-exporter_0.1.0_amd64.deb
-├── findoc-linux-exporter_0.1.0_amd64.deb.sha256
-├── findoc-linux-exporter-0.1.0-1.el7.x86_64.rpm
-└── findoc-linux-exporter-0.1.0-1.el7.x86_64.rpm.sha256
+├── latest.txt                                           0.2.1-1
+├── findoc-linux-exporter_0.2.1-1_amd64.deb   (+ .sha256, .asc)
+└── findoc-linux-exporter-0.2.1-1.el7.x86_64.rpm   (+ .sha256, .asc)
 ```
 
 ```bash
 sudo FINDOC_URL=http://packages.internal/findoc ./install.sh
 ```
 
-Checksums are verified either way.
+## Rolling out to many hosts
 
-## Rolling it out
-
-`install.sh` is safe to run unattended and is idempotent, so any configuration management tool
-can call it directly:
+`install.sh` is idempotent and safe to run unattended. It exits `0` only when the host is
+genuinely monitored, so a non-zero exit is a real failure:
 
 ```bash
-ansible all -b -m script -a "install.sh" -e "FINDOC_BACKEND=nats.your-site.internal:4222"
+ansible all -b -m script -a "install.sh" -e "FINDOC_BACKEND=nats.mumbai.internal:4222"
 ```
 
-It exits `0` only when the host is genuinely monitored, so a non-zero exit is a real failure
-worth surfacing rather than noise.
+A new host registers as **`collect_only`**: its metrics are stored and visible, but it cannot
+page anyone until an operator approves it. Paging is a deliberate act, not a side effect of
+installing software.
 
-A new host is registered as **`collect_only`**: scraped, stored and visible on dashboards, but
-unable to page anyone until an operator approves it. That is deliberate — paging is an opt-in
-act, not a side effect of installing software.
+Cloning VMs? Run `/opt/findoc-exporter/bin/findoc-agent/findoc-agent --prepare-image` before
+sealing the template, or every clone reports as the same machine.
+
+## Uninstalling
+
+```bash
+sudo apt-get remove findoc-linux-exporter     # Debian / Ubuntu
+sudo yum remove findoc-linux-exporter         # RHEL family
+```
+
+`/etc/findoc-monitor/host-id` is **kept on purpose**, even on purge. It is this host's name in
+the monitoring platform. A reinstalled machine with a new identity would come back as a new,
+unapproved host with no history.
+
+## What was verified for 0.2.1-1
+
+Measured against these exact packages, 2026-09-25:
+
+| Check | Result |
+|---|---|
+| Package contract | 33 passed, 0 failed |
+| CentOS 7 (glibc 2.17) | 23 passed, 0 failed |
+| systemd contract, booted systemd 255 | 26 passed, 0 failed |
+| Kill and restart matrix | 21 passed, 0 failed |
+| Upgrade from 0.1.3-2, with rollback | 20 passed, 0 failed |
+| Install, upgrade, uninstall, reinstall, purge | 33 passed, 0 failed |
+| `install.sh` on Debian 12, Ubuntu 20.04/22.04, AlmaLinux 8/9, CentOS 7 | 24 passed, 0 failed |
+
+Measured recovery: a killed heartbeat is back in under 0.9 s, and a killed `node_exporter` in
+under 5 s.
+
+Not yet verified, because each needs a real host: CentOS 7 running the unit under its own
+systemd 219, endpoint security and SELinux on a trading host, and the performance impact on one.
 
 ## Building the packages
 
-The build lives in the Findoc Monitoring platform repository, not here. This repository is for
-installing on a host.
+The build and its test harnesses live in the Findoc Monitoring platform repository. This
+repository is only for installing on a host.
 
 ## Licence
 

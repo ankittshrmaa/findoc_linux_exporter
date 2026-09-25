@@ -15,8 +15,12 @@ set -eu
 
 # Upstream version and package revision, as the packages are now named. A packaging-only
 # fix moves REVISION; the software version stays put.
-DEFAULT_VERSION=0.1.3
-DEFAULT_REVISION=2
+#
+# MUST equal packaging/findoc_linux_exporter/VERSION. release-gate.sh fails the release when it
+# does not: this default is what a host with no local package and no FINDOC_URL installs, and it
+# said 0.1.3-2 -- the previous generation, with :9100 open -- for the whole of 0.2.0 (item B3).
+DEFAULT_VERSION=0.2.1
+DEFAULT_REVISION=1
 # Where release assets live. The install repository, not the platform repository: the packages
 # are published for hosts to download, and the platform source is not what a monitored host
 # needs. https://github.com/ankittshrmaa/findoc_linux_exporter
@@ -182,6 +186,9 @@ if [ -z "$PKG" ] && [ -n "${FINDOC_URL:-}" ]; then
     # Optional: a mirror may not carry the checksum. Its absence is reported in step 4, loudly,
     # rather than treated as a download failure here.
     if fetch "$BASE/$NAME.sha256" "$WORK/$NAME.sha256"; then SUMFILE="$WORK/$NAME.sha256"; fi
+    # The signature too, or step 4b below never has anything to verify for a downloaded package
+    # and the only proof of origin this installer has is dead code. Optional here, reported there.
+    fetch "$BASE/$NAME.asc" "$WORK/$NAME.asc" || rm -f "$WORK/$NAME.asc"
 fi
 
 # 3c. GitHub Releases, last, because a trading host reaching the public internet is the
@@ -198,6 +205,7 @@ if [ -z "$PKG" ]; then
      with FINDOC_URL=http://your-server/path, or copy the package next to this script."
     PKG="$WORK/$NAME"
     if fetch "$URL.sha256" "$WORK/$NAME.sha256"; then SUMFILE="$WORK/$NAME.sha256"; fi
+    fetch "$URL.asc" "$WORK/$NAME.asc" || rm -f "$WORK/$NAME.asc"
 fi
 
 [ -f "$PKG" ] || die "no package to install."
@@ -264,7 +272,7 @@ fi
 # --- 5. install -------------------------------------------------------------------------------------
 #
 # Re-running is the upgrade path: both package managers replace in place, the scriptlets keep
-# exporter.env and the host identity, and the services are restarted onto the new binaries.
+# the configuration and the host identity, and the service is restarted onto the new binaries.
 say "Installing"
 if [ "$FAMILY" = debian ]; then
     # `apt-get install ./file.deb`, not `dpkg -i`.
@@ -319,6 +327,7 @@ fi
 # So the package manager's exit code is not trusted on its own. The installed agent is asked
 # what it is, and the answer has to match what was just installed.
 AGENT=/opt/findoc-exporter/bin/findoc-agent/findoc-agent
+MONITOR=/opt/findoc-exporter/bin/findoc-agent/findoc-monitor
 [ -x "$AGENT" ] || die "the install reported success but $AGENT is not there.
      Nothing was installed. Check the output above for what the package manager actually did."
 
@@ -347,7 +356,15 @@ info "installed: $INSTALLED_VER"
 #
 # `enable` still happens either way, so a host configured later comes up correctly at boot.
 # `.target` is required — systemd resolves a bare name to .service and there is deliberately no
-# findoc-exporter.service; see the comment block in findoc-exporter.target.
+# ONE unit since 0.1.5, and enabling the old target here would actively UNDO the install.
+# The package's postinst converges this host onto findoc-monitor and disables
+# findoc-exporter.target along with the two units under it. This script used to run
+# `systemctl enable --now findoc-exporter.target` straight afterwards, which re-enabled them
+# and started a second node_exporter against a :9100 the new one already held -- so the
+# metrics plane crash-looped forever on a host whose installer had just printed success.
+# The old names are not referenced here at all any more: they remain installed as the
+# migration's rollback path, and findoc-migrate is the only thing that should choose
+# between the two generations.
 BACKEND_OK=no
 if env -u FINDOC_BACKEND -u FINDOC_SITE "$AGENT" --show-backend >/dev/null 2>&1; then
     BACKEND_OK=yes
@@ -356,12 +373,12 @@ fi
 if [ ! -d /run/systemd/system ]; then
     info "systemd is not running here; skipping start"
 elif [ "$BACKEND_OK" = yes ]; then
-    say "Starting both planes"
-    systemctl enable --now findoc-exporter.target >/dev/null 2>&1 || true
+    say "Starting the monitoring service"
+    systemctl enable --now findoc-monitor >/dev/null 2>&1 || true
 else
     say "Enabling for boot, NOT starting"
     info "no backend is reachable — starting now would only retry into nothing"
-    systemctl enable findoc-exporter.target >/dev/null 2>&1 || true
+    systemctl enable findoc-monitor >/dev/null 2>&1 || true
 fi
 
 # --- 7. report what actually happened -------------------------------------------------------------
@@ -374,14 +391,22 @@ info "version   $("$AGENT" --version 2>/dev/null || echo 'unknown')"
 
 if [ ! -d /run/systemd/system ]; then
     echo
-    echo "Installed. Start it with: systemctl enable --now findoc-exporter.target"
+    echo "Installed. Start it with: systemctl enable --now findoc-monitor"
     exit 0
 fi
 
-HB=$(systemctl is-active findoc-exporter-heartbeat 2>/dev/null || true)
-MX=$(systemctl is-active findoc-exporter-metrics 2>/dev/null || true)
-info "heartbeat $HB"
-info "metrics   $MX"
+# Read the PLANES, not just the unit. `systemctl is-active findoc-monitor` answers yes while
+# a child crash-loops underneath it -- the exact lie the supervisor's status line exists to
+# stop telling -- so this reads the supervisor's own report.
+SVC=$(systemctl is-active findoc-monitor 2>/dev/null || true)
+PLANES=$(systemctl show -p StatusText --value findoc-monitor 2>/dev/null || true)
+HB=notrunning
+MX=notrunning
+case "$PLANES" in
+    *"all planes running"*) HB=active; MX=active ;;
+esac
+info "service   $SVC"
+info "planes    ${PLANES:-unknown}"
 
 # "monitored" requires BOTH that the units are running AND that the agent has somewhere to
 # report to. Units alone are not enough: a heartbeat agent retrying an unreachable address sits
@@ -400,11 +425,12 @@ if [ "$BACKEND_OK" = no ]; then
     echo
     env -u FINDOC_BACKEND -u FINDOC_SITE "$AGENT" --show-backend 2>&1 | sed 's/^/    /' || true
     echo
-    echo "    Fix one of the above, then: systemctl start findoc-exporter.target"
+    echo "    Fix one of the above, then: systemctl start findoc-monitor"
 else
     printf '\033[33m%s\033[0m\n' "Installed, a backend is reachable, but a service is not running:"
     echo "    heartbeat $HB / metrics $MX"
     echo
-    echo "    systemctl status findoc-exporter-heartbeat findoc-exporter-metrics"
+    echo "    systemctl status findoc-monitor"
+    echo "    $MONITOR status"
 fi
 exit 1
