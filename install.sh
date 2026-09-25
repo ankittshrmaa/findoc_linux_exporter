@@ -19,7 +19,7 @@ set -eu
 # MUST equal packaging/findoc_linux_exporter/VERSION. release-gate.sh fails the release when it
 # does not: this default is what a host with no local package and no FINDOC_URL installs, and it
 # said 0.1.3-2 -- the previous generation, with :9100 open -- for the whole of 0.2.0 (item B3).
-DEFAULT_VERSION=0.2.1
+DEFAULT_VERSION=0.2.2
 DEFAULT_REVISION=1
 # Where release assets live. The install repository, not the platform repository: the packages
 # are published for hosts to download, and the platform source is not what a monitored host
